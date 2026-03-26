@@ -1,57 +1,37 @@
-#include "my_alloc.h"
+#include "my_alloc_internal.h"
 
-#include <sys/mman.h>   // mmap, munmap
-#include <stddef.h>     // size_t, NULL
-#include <stdint.h>     // uint8_t, uintptr_t
-#include <string.h>     // memset (for zeroing)
-#include <stdlib.h>     // EXIT_SUCCESS, EXIT_FAILURE, abort()
-#include <stdio.h>      // fprintf, stderr
-#include <assert.h>			// for testing TODO
+/* ------------------------- Main Data Structures ------------------------- */
 
-#define PAGE_SIZE           4096
-#define POOL_SIZE           65536
-#define MAX_POOLS						256			// Generous upper bound
-#define NUM_SIZE_CLASSES    9
-#define MTE_GRANULE         16      // MTE tags at 16-byte granularity
-#define SLOT_USED						1
-#define SLOT_FREE						0	
-
-/**
- * Pool object
- */
-struct pool {
-	void *base_addr;
-	uint8_t *bitmap;
-	size_t slot_size;
-	size_t num_slots;
-	struct pool *next;
-};
-
-// Size classes our allocator supports
-size_t size_classes[NUM_SIZE_CLASSES] = 
+int pool_count = 0;		// Num pools created, NOT active	
+struct pool *pools[NUM_SIZE_CLASSES]; 
+struct pool pool_storage[MAX_POOLS];
+const size_t size_classes[NUM_SIZE_CLASSES] = 
 	{16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
 
-int pool_count = 0;															// Num pools allocated so far
+/* ----------------------------- Converters ----------------------------- */
 
-// Stack memory for now, use mmap later
-static struct pool *pools[NUM_SIZE_CLASSES];		// One pool list per size class
-static struct pool pool_storage[MAX_POOLS];			// Static for now (all mem for pools) 
+size_t get_size_class(size_t requested_size) {
+	// Step 1: Check if request is greater than 0 and less than max size
+	if (requested_size == 0 || requested_size > MAX_SIZE_CLASS)
+		return 0;
 
-void my_alloc_init() {
-	// Step 1: Zero out the pools array
-	// Each entry is a pointer to the first pool of that size class
-	// They start as NULL because that means no pool has been allocated (lazy)
-	for(int i = 0; i < NUM_SIZE_CLASSES; i++) {
-		pools[i] = NULL;
-	}
+  // Smallest size based on architecture
+  if (requested_size <= MIN_SIZE_CLASS) return MIN_SIZE_CLASS;
 
-	// Step 2: Rest the pool storage counter
-	pool_count = 0;
+	// Step 2: Find the nearest rounded up size 
+  // This is just powers of 2 so we can use a bit trick
+	requested_size--;
+  requested_size |= requested_size >> 1;
+  requested_size |= requested_size >> 2;
+  requested_size |= requested_size >> 4;
+  requested_size |= requested_size >> 8;
+  requested_size |= requested_size >> 16;
+  requested_size |= requested_size >> 32;
+  requested_size++;
+
+	return requested_size;
 }
 
-/**
- * Helper function to map a size_class to index of size_classes[].
- */
 int size_class_to_index(size_t size_class) {
 	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
 		if (size_classes[i] == size_class)
@@ -60,44 +40,46 @@ int size_class_to_index(size_t size_class) {
 	return -1;
 }
 
-/**
- * Rounds to the nearest size class for a requested size.
- * Returns 0 if invalid requested size given.
- */
-size_t get_size_class(size_t requested_size) {
-	// Step 1: Check if request is greater than 0 and less than max size
-	size_t max_size = size_classes[NUM_SIZE_CLASSES - 1];
-	if (requested_size == 0 || requested_size > max_size)
-		return 0;
+/* ----------------------- Searching/Creating Pools ----------------------- */
 
-	// Step 2: Find the nearest rounded up size
-	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
-		if (requested_size <= size_classes[i])
-		  return size_classes[i];
+int find_first_free_slot(uint8_t *bitmap, size_t num_slots, size_t *slot) {
+  if (!bitmap) {
+		fprintf(stderr, "@find_first_free_slot: Didn't get a valid bitmap pointer");
+		abort();
 	}
 
-	return 0;
+	for (size_t i = 0; i < num_slots; i++) {
+		if (bitmap[i] == SLOT_FREE) {
+      *slot = i;
+      return EXIT_SUCCESS;
+    }
+	}
+
+	return EXIT_FAILURE; // No free slot found
 }
 
-/**
- * Finds a pool of size class with a free slot. Otherwise, returns NULL.
- * If we have a lot of pools in a size class, could blow the stack. TODO.
- */
-struct pool* find_free_pool(struct pool * root) {
-	if (!root)
+struct pool * lookup_pool(void * ptr) {
+  if (!ptr)
 		return NULL;
-	
-	// Check if this pool has a free slot
-	for (size_t i = 0; i < root->num_slots; i++) {
-    if (root->bitmap[i] == SLOT_FREE)
-			return root;
+
+	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+		// Iterate over each size class list
+		struct pool * root = pools[i];
+
+		while (root) {
+			// For each pool in the list, check if pointer belongs
+			if (ptr >= root->base_addr && 
+					ptr < (void *)((uint8_t *)root->base_addr + POOL_SIZE)) {
+				return root;
+			}
+			root = root->next;
+		}
 	}
 
-	// Recurse on the next pool
-	return find_free_pool(root->next);
+	return NULL;
 }
 
-struct pool* create_new_pool(size_t slot_size) {
+struct pool * create_new_pool(size_t slot_size) {
 	// Step 1: Check if we can create any more pools
 	if (pool_count >= MAX_POOLS) {
 		fprintf(stderr, "@create_new_pool: Out of pool storage.\n");
@@ -124,24 +106,24 @@ struct pool* create_new_pool(size_t slot_size) {
 		abort();
 	}
 
-	printf("Allocated pool for size %d\n", (int)slot_size);
   return p;
 }
 
-
-int find_first_free_slot(uint8_t *bitmap, size_t num_slots) {
-  if (!bitmap) {
-		fprintf(stderr, "@find_first_free_slot: Didn't get a valid bitmap pointer");
-		abort();
+struct pool* find_free_pool(struct pool * root) {
+	if (!root)
+		return NULL;
+	
+	// Check if this pool has a free slot
+	for (size_t i = 0; i < root->num_slots; i++) {
+    if (root->bitmap[i] == SLOT_FREE)
+			return root;
 	}
 
-	for (int i = 0; i < (int)num_slots; i++) {
-		if (bitmap[i] == SLOT_FREE)
-			return i;
-	}
-
-	return -1; // No free slot found
+	// Recurse on the next pool
+	return find_free_pool(root->next);
 }
+
+/* ------------------------ Memory-Specific Actions ------------------------ */
 
 /**
  * Zeroes out memory for a given block.
@@ -150,14 +132,23 @@ void zero_memory(void * base_address, size_t slot_size) {
 	memset(base_address, 0, slot_size);
 }
 
-/**
- * External function.
- * Round @size up to nearest size class. Walk pools for that class (or lookup),
- * scanning each bitmap for a free slot. If no pool has space, allocate a new
- * bool via mmap. Mark the slow as used, zero it, and return 
- * base_addr + (slot_index * slot_size).
- */
-void *my_malloc(size_t size) {
+
+/* ------------------------ Main External Functions ------------------------ */
+
+void my_alloc_init() {
+	// Step 1: Zero out the pools array
+	// Each entry is a pointer to the first pool of that size class
+	// They start as NULL because that means no pool has been allocated (lazy)
+	for(int i = 0; i < NUM_SIZE_CLASSES; i++) {
+		pools[i] = NULL;
+	}
+
+	// Step 2: Reset the pool storage counter
+	pool_count = 0;
+}
+
+
+void * my_malloc(size_t size) {
 	// Step 1: Pick the right size class by rounding up to the nearest size	
 	size_t slot_size = get_size_class(size);
 	if (slot_size == 0)	// Invalid requested size given
@@ -166,23 +157,32 @@ void *my_malloc(size_t size) {
 	// Step 2: Find a pool with a free slot
 	int idx = size_class_to_index(slot_size);
 	struct pool * p = find_free_pool(pools[idx]);
+	if (p)
+		printf("Found pool %lx with free slot\n", (uintptr_t)p->base_addr);
 
 	// Step 3: If no pool has space, create a new one
 	if (!p) {
 		p = create_new_pool(slot_size);
 		struct pool * root = pools[idx];
-		if (root) {
-			p->next = root;
+		printf("Had to create pool %lx with free slot\n", (uintptr_t)p->base_addr);
+
+		if (!root) {
+			// No root pool yet, create the first one
+			pools[idx] = p;
+		} else {
+			// There is a root so keep iterating until we find a free next ptr
+			while (root->next) {
+				root = root->next;
+			}
+			root->next = p;
 		}
-		pools[idx] = p;
 	}
 
 	// Step 4: Find free slot within pool
-	int slot_idx = find_first_free_slot(p->bitmap, p->num_slots);
-	if (slot_idx == -1) {
+	size_t slot_idx;
+	if (find_first_free_slot(p->bitmap, p->num_slots, &slot_idx) == EXIT_FAILURE) {
 		return NULL;
 	}
-	printf("Got slot %d\n", slot_idx);
 
 	// Step 5: Mark as used
 	p->bitmap[slot_idx] = SLOT_USED;
@@ -193,55 +193,37 @@ void *my_malloc(size_t size) {
 	// Step 7: Zero out memory before handing it over
 	zero_memory(slot_address, p->slot_size);
 
-  return NULL;
+  return slot_address;
 }
+
 
 void my_free(void *ptr) {
-
-}
-
-void print_pools() {
-	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
-		struct pool * p = pools[i];
-		printf("+---------- START %000d ----------+\n", (int)size_classes[i]);
-		if (!p) {
-			printf("| NULL \t\t\t\t |\n");
-		} else { 
-			printf("| Base Addr: %x \t\t|\n", p->base_addr);
-			printf("| Num Slots: %d \t\t|\n", (int)p->num_slots);
-		}
-		printf("+----------- END %000d -----------+\n", (int)size_classes[i]);
+	// Step 1: Figure out which pool this pointer belongs to
+	// Start with just walking all the pools and chcking if pointer falls within
+	struct pool * p = lookup_pool(ptr);
+	if (!p) {
+		fprintf(stderr, "Failed to find a pool to which this pointer belongs.\n");
+		abort();
 	}
 
-	struct pool {
-	void *base_addr;
-	uint8_t *bitmap;
-	size_t slot_size;
-	size_t num_slots;
-	struct pool *next;
-};
-}
-
-int main() {
-  printf("--- Initialization ---\n");
-  my_alloc_init();
-	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
-		assert(pools[i] == NULL && "Init failed to NULL out each pointer");
+	// Step 2: Validate the pointer (start of slot & used)
+	size_t offset = ptr - p->base_addr;
+  if (offset % p->slot_size != 0) {
+		fprintf(stderr, "Pointer is not aligned.\n");
+		abort();
 	}
 
-	printf("--- Size Classes ---\n");
-	assert(get_size_class(1) == 16 && "Didn't round up 1 -> 16");
-	assert(get_size_class(15) == 16 && "Didn't round up 15 -> 16");
-	assert(get_size_class(16) == 16 && "Didn't do 16 -> 16");
-	assert(get_size_class(31) == 32 && "Didn't do 31 -> 32");
-	assert(get_size_class(0) == 0 && "Reject");
-	
+	int slot_idx = offset / p->slot_size;
 
-	printf("--- Malloc ---\n");
-	void * slab = my_malloc(16);
-	void * slab2 = my_malloc(16);
-	void * slab3 = my_malloc(64);
-	print_pools();
+	// Step 3: Mark the slot as free
+	if (p->bitmap[slot_idx] == SLOT_FREE) {
+		fprintf(stderr, "Double free detected!\n");
+		abort();
+	}
 
-	return 0;
+	p->bitmap[slot_idx] = SLOT_FREE;
+
+	// Step 4: Zero the slot
+	// Prevent use-after-free from reading stale data
+	zero_memory(ptr, p->slot_size);
 }
