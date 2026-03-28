@@ -7,7 +7,8 @@
 #include <string.h>               // memset (for zeroing)
 #include <stdlib.h>               // EXIT_SUCCESS, EXIT_FAILURE, abort()
 #include <stdio.h>                // fprintf, stderr
-#include <math.h>
+#include <arm_acle.h>             // ARM random tag
+
 #include "my_alloc.h"
 
 /* ------------------------------- Constants ------------------------------- */
@@ -20,7 +21,12 @@
 #define NUM_SIZE_CLASSES  9       // Arbitrary for now
 #define SLOT_USED         1       // Bitmap flag to indicate slot used
 #define SLOT_FREE         0	      // Bitmap flag to indicate not used
-#define MTE_GRANULE       6       // MTE tags at 16-byte granularity
+
+// MTE Granule is physically 16 bytes.
+#define MTE_GRANULE_SIZE  16
+
+// Helper to strip the top-byte tags for address comparisons
+#define UNTAG_PTR(ptr) (void*)((uintptr_t)(ptr) & ~((uintptr_t)0xFF << 56))
 
 /**
  * Pool of memory for a given size class.
@@ -39,11 +45,14 @@ struct pool {
 	struct pool *next;  // Pointer to next pool if exists
 };
 
-/* ------------------------- External Declarations ------------------------- */
+/* ---------------------------- Shared Globals ---------------------------- */
 extern int pool_count;                              // Num pools CREATED
 extern struct pool *pools[NUM_SIZE_CLASSES];        // 1 pool list / size class
 extern struct pool pool_storage[MAX_POOLS];         // All mem for pools
 extern const size_t size_classes[NUM_SIZE_CLASSES]; // Size classes supported
+int mte_flag;                                       // Using MTE Y or N
+
+/* ------------------------ Shared Internal Helpers ----------------------- */
 
 /**
  * get_size_class - Rounds up to nearest size class.
@@ -64,6 +73,15 @@ size_t get_size_class(size_t requested_size);
 int size_class_to_index(size_t size_class);
 
 /**
+ * lookup_pool - Walk all pools to find which pool this pointer belongs to
+ * 
+ * @ptr: Pointer for a slot in a pool
+ * 
+ * Returns: Pointer to pool it corresponds to; otherwise, NULL.
+ */
+struct pool * lookup_pool(void * ptr);
+
+/**
  * find_first_free_slot - Looks for first free slot (marked FREE) in bitmap for
  *                        a given pool.
  * 
@@ -75,14 +93,6 @@ int size_class_to_index(size_t size_class);
  */
 int find_first_free_slot(uint8_t *bitmap, size_t num_slots, size_t *slot);
 
-/**
- * lookup_pool - Walk all pools to find which pool this pointer belongs to
- * 
- * @ptr: Pointer for a slot in a pool
- * 
- * Returns: Pointer to pool it corresponds to; otherwise, NULL.
- */
-struct pool * lookup_pool(void * ptr);
 
 /**
  * find_free_pool - Finds pool of size class with a free slot. 
