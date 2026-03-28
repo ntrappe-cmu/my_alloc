@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <stdio.h> 
 #include <assert.h>
+#include <signal.h>           // MTE specific
+#include <unistd.h>           // MTE specific
+#include <sys/wait.h>         // MTE specific
 #include "my_alloc_internal.h"
 
 // Simple test runner macro
@@ -140,7 +143,6 @@ void test_malloc2() {
   // We have a memory leak (didn't free)
 }
 
-
 void test_free1() {
   void * slab1 = my_malloc(16);
   void * slab2 = my_malloc(32);
@@ -156,6 +158,27 @@ void test_free1() {
   // assert(pools[8] == NULL);
 }
 
+void test_mte_tag_generation() {
+  my_alloc_init();
+
+  void *ptr1 = my_malloc_mte(16);
+  void *ptr2 = my_malloc_mte(16);
+
+  // Just look at upper bits that are the tag
+  uintptr_t tag1 = (uintptr_t)ptr1 >> 56;
+  uintptr_t tag2 = (uintptr_t)ptr2 >> 56;
+
+  printf("   Tag 1: 0x%lx, Tag 2: 0x%lx\n", tag1, tag2);
+
+  // Note: still could match bc we didn't restrict that
+  // but better be non-zero!!
+  assert(ptr1 != ptr2);
+  assert(ptr1 != 0);
+
+  my_free(ptr1);
+  my_free(ptr2);
+}
+
 /* ------- MAIN TEST RUNNER ------- */
 int main() {
   printf("Starting tests...\n\n");
@@ -165,6 +188,8 @@ int main() {
   RUN_TEST(test_malloc_free1);
   // RUN_TEST(test_malloc_free2);
   // RUN_TEST(test_free1);
+
+  // RUN_TEST(test_mte_tag_generation);
 
   printf("===== ALL TESTS PASSED! =====\n");
   return 0;
