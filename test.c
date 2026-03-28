@@ -179,6 +179,13 @@ void test_mte_tag_generation() {
   my_free(ptr2);
 }
 
+void test_alignment() {
+  void *ptr = my_malloc(17);
+  // Check 16-byte alignment (necessary for MTE)
+  assert(((uintptr_t)UNTAG_PTR(ptr) % 16) == 0);
+  my_free(ptr);
+}
+
 /* ------- MAIN TEST RUNNER ------- */
 int main() {
   printf("Starting tests...\n\n");
@@ -189,7 +196,8 @@ int main() {
   // RUN_TEST(test_malloc_free2);
   // RUN_TEST(test_free1);
 
-  // RUN_TEST(test_mte_tag_generation);
+  RUN_TEST(test_mte_tag_generation);
+  RUN_TEST(test_alignment);
 
   printf("===== ALL TESTS PASSED! =====\n");
   return 0;
