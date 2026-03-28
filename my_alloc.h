@@ -19,6 +19,7 @@ void my_alloc_init(void);
  *          The returned memory is zeroed.
  */
 void * my_malloc(size_t size);
+void *my_malloc_mte(size_t size);
 
 /**
  * my_free - Deallocate a block of memory specified by pointer @ptr.
