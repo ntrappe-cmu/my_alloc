@@ -50,7 +50,6 @@ extern int pool_count;                              // Num pools CREATED
 extern struct pool *pools[NUM_SIZE_CLASSES];        // 1 pool list / size class
 extern struct pool pool_storage[MAX_POOLS];         // All mem for pools
 extern const size_t size_classes[NUM_SIZE_CLASSES]; // Size classes supported
-int mte_flag;                                       // Using MTE Y or N
 
 /* ------------------------ Shared Internal Helpers ----------------------- */
 
