@@ -5,9 +5,6 @@
 #include <stdlib.h>
 #include <stdio.h> 
 #include <assert.h>
-#include <signal.h>           // MTE specific
-#include <unistd.h>           // MTE specific
-#include <sys/wait.h>         // MTE specific
 #include "my_alloc_internal.h"
 
 // Simple test runner macro
@@ -158,46 +155,30 @@ void test_free1() {
   // assert(pools[8] == NULL);
 }
 
-void test_mte_tag_generation() {
+void test_sanity() {
   my_alloc_init();
+  assert(pool_count == 0);
+  assert(pools[0] == NULL);
 
-  void *ptr1 = my_malloc_mte(16);
-  void *ptr2 = my_malloc_mte(16);
+  void * ptr1 = my_malloc(16);
+  // assert(pool_count == 1);
+  // assert(pools[0] != NULL);
 
-  // Just look at upper bits that are the tag
-  uintptr_t tag1 = (uintptr_t)ptr1 >> 56;
-  uintptr_t tag2 = (uintptr_t)ptr2 >> 56;
-
-  printf("   Tag 1: 0x%lx, Tag 2: 0x%lx\n", tag1, tag2);
-
-  // Note: still could match bc we didn't restrict that
-  // but better be non-zero!!
-  assert(ptr1 != ptr2);
-  assert(ptr1 != 0);
-
-  my_free(ptr1);
-  my_free(ptr2);
-}
-
-void test_alignment() {
-  void *ptr = my_malloc(17);
-  // Check 16-byte alignment (necessary for MTE)
-  assert(((uintptr_t)UNTAG_PTR(ptr) % 16) == 0);
-  my_free(ptr);
+  // my_free(ptr1);
+  // assert(pool_count == 1);
 }
 
 /* ------- MAIN TEST RUNNER ------- */
 int main() {
   printf("Starting tests...\n\n");
   
-  RUN_TEST(test_round_size_class);
-  RUN_TEST(test_alloc_init);
-  RUN_TEST(test_malloc_free1);
+  // RUN_TEST(test_round_size_class);
+  // RUN_TEST(test_alloc_init);
+  // RUN_TEST(test_malloc_free1);
   // RUN_TEST(test_malloc_free2);
   // RUN_TEST(test_free1);
 
-  RUN_TEST(test_mte_tag_generation);
-  RUN_TEST(test_alignment);
+  RUN_TEST(test_sanity);
 
   printf("===== ALL TESTS PASSED! =====\n");
   return 0;

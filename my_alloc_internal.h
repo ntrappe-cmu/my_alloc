@@ -1,32 +1,33 @@
 #ifndef MY_ALLOC_INTERNAL_H
 #define MY_ALLOC_INTERNAL_H
 
-#include <sys/mman.h>             // mmap, munmap
-#include <stddef.h>               // size_t, NULL
-#include <stdint.h>               // uint8_t, uintptr_t
-#include <string.h>               // memset (for zeroing)
-#include <stdlib.h>               // EXIT_SUCCESS, EXIT_FAILURE, abort()
-#include <stdio.h>                // fprintf, stderr
-#include <arm_acle.h>             // ARM random tag
+#include <sys/mman.h>				// mmap, munmap
+#include <stddef.h>					// size_t, NULL
+#include <stdint.h>					// uint8_t, uintptr_t
+#include <string.h>					// memset (for zeroing)
+#include <stdlib.h>					// EXIT_SUCCESS, EXIT_FAILURE, abort()
+#include <stdio.h>					// fprintf, stderr
+#include <arm_acle.h>				// ARM random tag
 
 #include "my_alloc.h"
 
 /* ------------------------------- Constants ------------------------------- */
 
-#define PAGE_SIZE         4096    
-#define POOL_SIZE         65536   // 65KB for whole pool
-#define MAX_SIZE_CLASS    4096    // Largest size class offered
-#define MIN_SIZE_CLASS    16      // Smallest size class offered (64bit arch)
-#define MAX_POOLS			    256			// Generous upper bound
-#define NUM_SIZE_CLASSES  9       // Arbitrary for now
-#define SLOT_USED         1       // Bitmap flag to indicate slot used
-#define SLOT_FREE         0	      // Bitmap flag to indicate not used
+#define POOL_SIZE 			65536	// 65KB for whole pool
+#define MAX_SIZE_CLASS		4096    // Largest size class offered
+#define MIN_SIZE_CLASS		16      // Smallest size class offered (64bit arch)
+#define MAX_POOLS			256		// Generous upper bound
+#define PAGE_SIZE 			4096	// POOL_SIZE / MIN_SIZE_CLASS
+
+#define NUM_SIZE_CLASSES 	9       // Arbitrary for now
+#define SLOT_USED			1       // Bitmap flag to indicate slot used
+#define SLOT_FREE			0		// Bitmap flag to indicate not used
 
 // MTE Granule is physically 16 bytes.
-#define MTE_GRANULE_SIZE  16
+#define MTE_GRANULE_SIZE 	16
 
 // Helper to strip the top-byte tags for address comparisons
-#define UNTAG_PTR(ptr) (void*)((uintptr_t)(ptr) & ~((uintptr_t)0xFF << 56))
+// #define UNTAG_PTR(ptr) (void*)((uintptr_t)(ptr) & ~((uintptr_t)0xFF << 56))
 
 /**
  * Pool of memory for a given size class.
@@ -78,7 +79,7 @@ int size_class_to_index(size_t size_class);
  * 
  * Returns: Pointer to pool it corresponds to; otherwise, NULL.
  */
-struct pool * lookup_pool(void * ptr);
+struct pool* lookup_pool(void *ptr);
 
 /**
  * find_first_free_slot - Looks for first free slot (marked FREE) in bitmap for
@@ -88,20 +89,9 @@ struct pool * lookup_pool(void * ptr);
  * @num_slots: Number of slots for this pool.
  * @slot: Pass-thru for slot selection.
  * 
- * Returns: EXIT_SUCCESS if free slot found; otherwise, EXIT_FAILURE.
+ * Returns: EXIT_SUCCESS if free slot found; otherwise, -1.
  */
 int find_first_free_slot(uint8_t *bitmap, size_t num_slots, size_t *slot);
-
-
-/**
- * find_free_pool - Finds pool of size class with a free slot. 
- * TODO: if we have a lot of pools in a size class, could blow the stack.
- * 
- * @root: Pointer to first pool of the list.
- * 
- * Returns: Pointer to pool with space; otherwie, NULL.
- */
-struct pool * find_free_pool(struct pool * root);
 
 /**
  * create_new_pool - Creates a pool for a given size class.
@@ -110,40 +100,7 @@ struct pool * find_free_pool(struct pool * root);
  * 
  * Returns: Pointer to the new pool. NULL if failure occurred.
  */
-struct pool * create_new_pool(size_t slot_size);
+struct pool* create_new_pool(size_t slot_size);
 
-/* ------------------------ Memory-Specific Actions ------------------------ */
-
-/**
- * Zeroes out memory for a given block.
- */
-void zero_memory(void * base_address, size_t slot_size);
-
-/* ------------------------ Debugging/Observability ------------------------ */
-
-// void print_pools() {
-// 	for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
-// 		struct pool * p = pools[i];
-// 		printf("+---------- START %000d ----------+\n", (int)size_classes[i]);
-// 		if (!p) {
-// 			printf("| NULL \t\t\t\t |\n");
-// 		} else { 
-// 			printf("| Num Slots: %d \t\t|\n", (int)p->num_slots);
-// 			printf("| Size: %d \t\t\t|\n", (int)p->slot_size);
-// 			int pool_num = 0;
-// 			while (p) {
-// 				printf("| Pool %d: %p \t\t|\n", pool_num, p->base_addr);
-// 				printf("| Bitmap: \t\t\t|\n");
-// 				for (int i = 0; i < 16; i++) {
-// 					printf("| %s ", p->bitmap[i] == SLOT_FREE ? "FREE" : "USED");
-// 				}
-// 				printf("|...|\n");
-// 				p = p->next;
-// 				pool_num++;
-// 			}
-// 		}
-// 		printf("+----------- END %000d -----------+\n", (int)size_classes[i]);
-// 	}
-// }
 
 #endif
