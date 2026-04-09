@@ -44,7 +44,7 @@ int find_first_free_slot(uint8_t *bitmap, size_t num_slots, size_t *slot) {
             return EXIT_SUCCESS;
         }
     }
-    return -1;
+    return EXIT_FAILURE;
 }
 
 /* ----------------------- Searching/Creating Pools ----------------------- */
@@ -75,20 +75,36 @@ struct pool* create_new_pool(size_t slot_size) {
     p->num_slots = POOL_SIZE / slot_size;
     p->next = NULL;
   
+    // Allocate PAGE for bitmap where each byte maps to 1 slot
     p->bitmap = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // Allocate entire pool of memory for each base address
     p->base_addr = mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
     if (p->bitmap == MAP_FAILED || p->base_addr == MAP_FAILED) {
         fprintf(stderr, "@create_new_pool: Failed allocate memory for pool\n");
         return NULL;
     }
-  return p;
+    return p;
 }
 
 /* ------------------------ Main External Functions ------------------------ */
 
 void my_alloc_init() {
-    for(int i = 0; i < NUM_SIZE_CLASSES; i++) {
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        pools[i] = NULL;
+    }
+    pool_count = 0;
+}
+
+void my_alloc_destroy() {
+    for (int i = 0; i < NUM_SIZE_CLASSES; i++) {
+        struct pool *p = pools[i];
+
+        while (p) {
+            munmap(p->base_addr, POOL_SIZE);
+            munmap(p->bitmap, PAGE_SIZE);
+            p = p->next;
+        }
         pools[i] = NULL;
     }
     pool_count = 0;
@@ -143,7 +159,6 @@ void my_free(void *ptr) {
     }
 
     size_t idx = offset / p->slot_size;
-
     if (p->bitmap[idx] == SLOT_FREE) {
         fprintf(stderr, "Double free detected!\n");
         return;

@@ -159,13 +159,30 @@ void test_sanity() {
   my_alloc_init();
   assert(pool_count == 0);
   assert(pools[0] == NULL);
+  assert(pools[1] == NULL);
+  assert(pools[2] == NULL);
 
   void * ptr1 = my_malloc(16);
-  // assert(pool_count == 1);
-  // assert(pools[0] != NULL);
+  assert(pool_count == 1);
+  assert(pools[0] != NULL);
+  assert(pools[0]->bitmap[0] == SLOT_USED);
+  assert(pools[0]->bitmap[1] == SLOT_FREE);
 
-  // my_free(ptr1);
-  // assert(pool_count == 1);
+  void * ptr2 = my_malloc(16);
+  assert(pools[0]->bitmap[0] == SLOT_USED);
+  assert(pools[0]->bitmap[1] == SLOT_USED);
+
+  my_free(ptr1);
+  my_free(ptr2);
+  assert(pool_count == 1);
+  assert(pools[0]->bitmap[0] == SLOT_FREE);
+  assert(pools[0]->bitmap[1] == SLOT_FREE);
+
+  my_alloc_destroy();
+  assert(pool_count == 0);
+  assert(pools[0] == NULL);
+  assert(pools[1] == NULL);
+  assert(pools[2] == NULL);
 }
 
 /* ------- MAIN TEST RUNNER ------- */

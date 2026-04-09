@@ -7,60 +7,97 @@
 /* ========================= MTE Helper Functions ========================= */
 
 static void stamp_tag(void *tagged_ptr, size_t size) {
-  // Iterate over slot and "color" each memory granule
-  for (size_t i = 0; i < size; i += MTE_GRANULE_SIZE) {
-    __arm_mte_set_tag((uint8_t *)tagged_ptr + i);
-  }
+    // Iterate over slot and "color" each memory granule
+    for (size_t i = 0; i < size; i += MTE_GRANULE_SIZE) {
+        __arm_mte_set_tag((uint8_t *)tagged_ptr + i);
+    }
 }
 
 
 static struct pool* create_pool_mte(size_t slot_size) {
-  if (pool_count >= MAX_POOLS) return NULL;
-  struct pool *p = &pool_storage[pool_count++];
-  p->slot_size = slot_size;
-  p->num_slots = POOL_SIZE / slot_size;
-  p->bitmap = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pool_count >= MAX_POOLS) return NULL;
 
-  // Now we differ from standard create_pool
-  p->base_addr = mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE | PROT_MTE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  p->next = NULL;
+    struct pool *p = &pool_storage[pool_count++];
 
-  if (p->bitmap == MAP_FAILED || p->base_addr == MAP_FAILED) abort();
-  return p;
+    p->slot_size = slot_size;
+    p->num_slots = POOL_SIZE / slot_size;
+    p->next = NULL;
+
+    // Almost same but also add MTE tagging support
+    p->bitmap = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    p->base_addr = mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE | PROT_MTE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    
+
+    if (p->bitmap == MAP_FAILED || p->base_addr == MAP_FAILED) {
+        fprintf(stderr, "@create_new_pool: Failed allocate memory for pool\n");
+        return NULL;
+    }
+    return p;
 }
 
 void *my_malloc_mte(size_t size) {
-  size_t slot_size = get_size_class(size);
-  if (!slot_size) return NULL;
+    /* Step 1: Round up to size class */
+    size_t slot_size = get_size_class(size);
+    if (slot_size == 0) return NULL;
 
-  int idx = size_class_to_index(slot_size);
-  struct pool *p = pools[idx];
-  size_t slot_idx;
+    /* Step 2: Map size class to index */
+    int idx = size_class_to_index(slot_size);
+    if (idx == -1) return NULL;
 
-  while (p && find_first_free_slot(p->bitmap, p->num_slots, &slot_idx) == EXIT_FAILURE) {
-    p = p->next;
-  }
+    struct pool *p = pools[idx];
+    size_t slot_idx;
 
-  if (!p) {
-    p = create_pool_mte(slot_size);
-    p->next = pools[idx];
-    pools[idx] = p;
-    slot_idx = 0;
-  } else {
-    find_first_free_slot(p->bitmap, p->num_slots, &slot_idx);
-  }
+    /* Step 3: Search existing pools for free slot */
+    while (p && find_first_free_slot(p->bitmap, p->num_slots, &slot_idx) != EXIT_SUCCESS) {
+        p = p->next;
+    }
 
-  p->bitmap[slot_idx] = SLOT_USED;
-  void *untagged_addr = (uint8_t*)p->base_addr + (slot_idx * p->slot_size);
+    /* Step 4: If none found, create a new pool and insert at head */
+    if (!p) {
+        p = create_pool_mte(slot_size);
+        if (!p) return NULL;
+        p->next = pools[idx];
+        pools[idx] = p;
+        slot_idx = 0;
+    }
 
-  // Now we differ from standard malloc
-  // Step 1: Create a RANDOM tag in the upper bits of the pointer
-  //    For now, we don't restrict what gets chosen
-  void *tagged_ptr = __arm_mte_create_random_tag(untagged_addr, 0);
+    /* Step 5: Mark slot used, zero memory, return pointer */
+    p->bitmap[slot_idx] = SLOT_USED;
 
-  // Step 2: Paint the memory granules with the tag
-  stamp_tag(tagged_ptr, p->slot_size);
+    /* Step 6: Create a random tag in the upper bits of the pointer (any are ok) */
+    void *untagged_addr = (uint8_t*)p->base_addr + (slot_idx * p->slot_size);
+    void *tagged_ptr = __arm_mte_create_random_tag(untagged_addr, 0);
 
-  memset(tagged_ptr, 0, p->slot_size);
-  return tagged_ptr;
+    /* Step 7: Paint memory granules with tag */
+    stamp_tag(tagged_ptr, p->slot_size);
+
+    memset(tagged_ptr, 0, p->slot_size);
+    return tagged_ptr;
+}
+
+void my_free_mte(void *ptr) {
+    if (!ptr) return;
+
+    // Strip upper bits before we do a lookup
+    void *untagged_ptr = UNTAG_PTR(ptr);
+    struct pool *p = lookup_pool(untagged_ptr);
+    if (!p) {
+        fprintf(stderr, "Failed to find a pool to which this pointer belongs.\n");
+        return;
+    }
+
+    size_t offset = (uintptr_t)untagged_ptr - (uintptr_t)p->base_addr;
+    if (offset % p->slot_size != 0) {
+        fprintf(stderr, "Pointer is not aligned.\n");
+        return;
+    }
+
+    size_t idx = offset / p->slot_size;
+    if (p->bitmap[idx] == SLOT_FREE) {
+        fprintf(stderr, "Double free detected!\n");
+        return;
+    }
+
+    p->bitmap[idx] = SLOT_FREE;
+    memset(untagged_ptr, 0, p->slot_size);
 }

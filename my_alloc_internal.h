@@ -27,7 +27,7 @@
 #define MTE_GRANULE_SIZE 	16
 
 // Helper to strip the top-byte tags for address comparisons
-// #define UNTAG_PTR(ptr) (void*)((uintptr_t)(ptr) & ~((uintptr_t)0xFF << 56))
+#define UNTAG_PTR(ptr) (void*)((uintptr_t)(ptr) & ~((uintptr_t)0xFF << 56))
 
 /**
  * Pool of memory for a given size class.
@@ -89,7 +89,7 @@ struct pool* lookup_pool(void *ptr);
  * @num_slots: Number of slots for this pool.
  * @slot: Pass-thru for slot selection.
  * 
- * Returns: EXIT_SUCCESS if free slot found; otherwise, -1.
+ * Returns: EXIT_SUCCESS if free slot found; otherwise, EXIT_FAILURE
  */
 int find_first_free_slot(uint8_t *bitmap, size_t num_slots, size_t *slot);
 
