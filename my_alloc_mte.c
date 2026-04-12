@@ -100,4 +100,9 @@ void my_free_mte(void *ptr) {
 
     p->bitmap[idx] = SLOT_FREE;
     memset(untagged_ptr, 0, p->slot_size);
+
+    // After memset retag so stale pointers fault
+    void *slot_addr = (uint8_t *)p->base_addr + (idx * p->slot_size);
+    void *new_tag = __arm_mte_create_random_tag(slot_addr, 0);
+    stamp_tag(new_tag, p->slot_size);
 }

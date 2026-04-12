@@ -32,5 +32,6 @@ void *my_malloc_mte(size_t size);
  * @ptr: Pointer to memory block to be deallocated.
  */
 void my_free(void *ptr);
+void my_free_mte(void *ptr);
 
 #endif

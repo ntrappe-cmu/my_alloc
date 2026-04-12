@@ -7,7 +7,10 @@
 #include <string.h>					// memset (for zeroing)
 #include <stdlib.h>					// EXIT_SUCCESS, EXIT_FAILURE, abort()
 #include <stdio.h>					// fprintf, stderr
+
+#ifdef MTE_ENABLED
 #include <arm_acle.h>				// ARM random tag
+#endif
 
 #include "my_alloc.h"
 

@@ -36,7 +36,7 @@ int size_class_to_index(size_t size_class) {
 }
 
 int find_first_free_slot(uint8_t *bitmap, size_t num_slots, size_t *slot) {
-    if (!bitmap) return -1;
+    if (!bitmap) return EXIT_FAILURE;
 
     for (size_t i = 0; i < num_slots; i++) {
         if (bitmap[i] == SLOT_FREE) {

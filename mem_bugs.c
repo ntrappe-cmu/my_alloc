@@ -13,24 +13,50 @@
 #endif
 
 void test_use_after_free() {
+    printf("=== Use-After-Free ===\n");
     // 1. Allocate a 16-byte slot and cast it
     int *ptr = (int *)ALLOC(16);
     // 2. Write data to it
     *ptr = 42;
     // 3. Free it
     FREE(ptr);
+    // 4. Read through stale pointer
     printf("Value %d\n", *ptr);
 }
 
 void test_heap_buffer_overflow() {
-
+    printf("=== Heap Buffer Overflow ===\n");
+    // 1. Allocate a 16-byte slot and cast it
+    uint8_t *ptr = (uint8_t *)ALLOC(16);
+    // 2. Write past the end (byte 16, 17, etc)
+    for (int i = 0; i <= 16; i++) {
+        ptr[i] = i + 1;
+    }
+    FREE(ptr);
 }
 
 void test_double_free() {
-
+    printf("=== Double Free ===\n");
+    // 1. Allocate a slot
+    void * ptr = ALLOC(128);
+    // 2. Free it
+    FREE(ptr);
+    // 3. Free again
+    FREE(ptr);
 }
 
 void test_uninitialized_read() {
+    printf("=== Uninitialized Read ===\n");
+    // 1. Allocate slot
+    int *ptr = (int *)ALLOC(2048);
+    // 2. Read before writing to it
+    printf("Value %d\n", *ptr);
+    // 3. Verify contents are zero
+    if (*ptr == 0) {
+        printf("Contents have been zeroed\n");
+    } else {
+        printf("Contents were not zeroed\n");
+    }
 }
 
 int main(int argc, char *argv[]) {
