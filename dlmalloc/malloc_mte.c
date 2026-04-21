@@ -2076,6 +2076,22 @@ static void mte_untag_region(void *ptr, size_t size) {
   }
 }
 
+/**
+ * Retag the pointer with a new tag. If this looks almost identical to 
+ * mte_tag_chunk, that's right. But this returns the pointer, not an offset
+ * to user data and as an mchunkptr for free().
+ */
+static mchunkptr mte_retag_chunk(mchunkptr p) {
+  // Iterate over the entire pointer we've given to the user
+  size_t chunk_size = chunksize(p);
+  // p must be untagged (tag 0) on entry
+  void *tagged_ptr = __arm_mte_create_random_tag((void *)p, 0);
+  for (size_t i = 0; i < chunk_size; i += MTE_GRANULE_SIZE) {
+    __arm_mte_set_tag((uint8_t *)tagged_ptr + i);
+  }
+  return (mchunkptr)tagged_ptr;
+}
+
 #endif
 
 /* ------------- End helper routines dealing with MTE  --------------- */
@@ -3594,8 +3610,18 @@ Void_t* mALLOc(size_t bytes)
   if ((CHUNK_SIZE_T)(nb) <= (CHUNK_SIZE_T)(av->max_fast)) { 
     // printf("@dlmalloc, we are a fastbin try bin %d\n", (int)fastbin_index(nb));
     fb = &(av->fastbins[(fastbin_index(nb))]);
-    if ( (victim = *fb) != 0) {
-      *fb = victim->fd;
+
+    if ((victim = *fb) != 0) {
+      // Victim is still tagged (freed memory was re-tagged)
+      *fb = victim->fd; // Read through 
+
+      #ifdef MTE_ENABLED
+      // Untag so check_remalloced_chunk can reader header fields
+      INTERNAL_SIZE_T vsize = chunksize(victim);
+      mte_untag_region((void *)UNTAG_PTR(victim), vsize);
+      victim = (mchunkptr)UNTAG_PTR(victim);
+      #endif
+
       check_remalloced_chunk(victim, nb);
       // printf("@dlmalloc, set fb to victim->fd %p\n", victim->fd);
       // print_av(av);
@@ -3969,22 +3995,13 @@ void fREe(mem) Void_t* mem;
     printf("@free, mem2chunk returned %p\n", p);
     size = chunksize(p);
 
-    // Untag before we attempt to read the header
     #ifdef MTE_ENABLED
-    // Untag chunk's memory
+    // Set tag to 0 in upper bits (overwrites tag assignment)
+    p = UNTAG_PTR(p);
+    // Stamp new tag into every granule to access header
     mte_untag_region((void *)UNTAG_PTR(p), size);
-
-    printf("@free, verify the stamp actually took...\n");
-    void *check = __arm_mte_get_tag((void *)UNTAG_PTR(p));
-    unsigned mem_tag = ((uintptr_t)check >> 56) & 0xf;
-    printf("@free post-untag: addr=%p memory tag=%u (expect 0)\n", (void*)UNTAG_PTR(p), mem_tag);
-
-    void *user_addr = (char *)UNTAG_PTR(p) + 2*SIZE_SZ;
-    void *check2 = __arm_mte_get_tag(user_addr);
-    unsigned user_mem_tag = ((uintptr_t)check2 >> 56) & 0xf;
-    printf("@free post-untag: user_addr=%p memory tag=%u (expect 0)\n", user_addr, user_mem_tag);
-
-    p = (mchunkptr)UNTAG_PTR(p);
+    // Change back to mchunkptr type
+    p = (mchunkptr)p;
     #endif
 
     #ifdef MTE_ENABLED
@@ -4010,10 +4027,15 @@ void fREe(mem) Void_t* mem;
       set_fastchunks(av);
       fb = &(av->fastbins[fastbin_index(size)]);
       printf("@free, setting fastbins to %p\n", fb);
-      p->fd = *fb;
-      // printf("@free, now fd for this pointer set to address of fastbin\n");
-      *fb = p;
-      // printf("@free, *fb = p now\n");
+
+      #ifdef MTE_ENABLED
+      // Retag pointer before linking for next use
+      // THIS HAPPENS BEFORE *fb = p IN FASTBIN PATH
+      p = (mchunkptr)mte_retag_chunk(p);
+      #endif
+
+      p->fd = *fb; // fb carries some other chunk's free tag
+      *fb = p; // store tag in fastbin header to use on next pop
     }
 
     /*
@@ -4032,11 +4054,18 @@ void fREe(mem) Void_t* mem;
 
       /* consolidate backward */
       if (!prev_inuse(p)) {
-        prevsize = p->prev_size;
+        prevsize = p->prev_size; // read at tag 0
         size += prevsize;
         p = chunk_at_offset(p, -((long) prevsize));
-        unlink(p, bck, fwd);
+
+        #ifdef MTE_ENABLED
+        p = mte_get_chunk_tag(p); // Retrieve its tag
+        #endif
+
+        unlink(p, bck, fwd);  // unlink reads fd/bk through p
       }
+
+      // at this stage, p is still stamped with prev's random tag
 
       if (nextchunk != av->top) {
         /* get and clear inuse bit */
@@ -4045,6 +4074,7 @@ void fREe(mem) Void_t* mem;
 
         /* consolidate forward */
         if (!nextinuse) {
+          // No problem because nextchunk already has its tag from prev call
           unlink(nextchunk, bck, fwd);
           size += nextsize;
         }
@@ -4057,12 +4087,19 @@ void fREe(mem) Void_t* mem;
 
         bck = unsorted_chunks(av);
         fwd = bck->fd;
-        p->bk = bck;
-        p->fd = fwd;
-        bck->fd = p;
-        fwd->bk = p;
 
-        set_head(p, size | PREV_INUSE);
+        #ifdef MTE_ENABLED
+        // Retag pointer before linking for next use
+        // THIS HAPPENS BEFORE bck->fd = p in UNSORTED BIN INSERT
+        p = (mchunkptr)mte_retag_chunk(p);
+        #endif
+
+        p->bk = bck;  // writes thru tagged p
+        p->fd = fwd;
+        bck->fd = p;  // writes to bck (has own tag)
+        fwd->bk = p;  // writes to fwd's bk (fwd has own tag)
+
+        set_head(p, size | PREV_INUSE); // writes p->size thru tagged p
         set_foot(p, size);
         
         check_free_chunk(p);
@@ -4076,7 +4113,7 @@ void fREe(mem) Void_t* mem;
       else {
         size += nextsize;
         set_head(p, size | PREV_INUSE);
-        av->top = p;
+        av->top = p;  // stores p at tag 0 but ok bc never tag top
         check_chunk(p);
       }
 

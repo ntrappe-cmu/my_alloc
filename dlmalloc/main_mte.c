@@ -54,10 +54,14 @@ int main() {
     dlfree(tiny_ptr);
 
     /* THE FOLLOWING ARE COMMENTED OUT BECAUASE THEY WILL CRASH (GOOD) */
-    
+
     // printf("TEST: Freed tiny_ptr. Attempting stale read...\n");
     // volatile uint8_t uaf_val = ((volatile uint8_t *)tiny_ptr)[0];
     // printf("!! UAF read succeeded (BUG NOT CAUGHT): %d\n", uaf_val);
+
+    void *reuse_tiny_ptr = dlmalloc(16);
+    printf("!! \t(Reuse) Allocated %d bytes of memory at %p\n", (int)num_bytes, reuse_tiny_ptr);
+    dlfree(reuse_tiny_ptr);
 
     // printf("TEST: Flip one tag bit...\n");
     // volatile uint8_t *bad = (uint8_t *)((uintptr_t)tiny_ptr2 ^ (1UL << 56));
