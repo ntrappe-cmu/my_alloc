@@ -1962,9 +1962,9 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /* pad request bytes into a usable size -- internal version */
 
 #define request2size(req)                                         \
-  (((req) + SIZE_SZ + MALLOC_ALIGN_MASK < MINSIZE)  ?             \
+  (((req) + 2*SIZE_SZ + MALLOC_ALIGN_MASK < MINSIZE)  ?             \
    MINSIZE :                                                      \
-   ((req) + SIZE_SZ + MALLOC_ALIGN_MASK) & ~MALLOC_ALIGN_MASK)
+   ((req) + 2*SIZE_SZ + MALLOC_ALIGN_MASK) & ~MALLOC_ALIGN_MASK)
 
 /*  Same, except also perform argument check */
 
@@ -2017,8 +2017,16 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #define chunk_at_offset(p, s)  ((mchunkptr)(((char*)(p)) + (s)))
 
 /* extract p's inuse bit */
+#ifdef MTE_ENABLED
+#define inuse(p) ({                                                     \
+  mchunkptr _inp = (mchunkptr)(((char*)(p)) + ((p)->size & ~PREV_INUSE)); \
+  _inp = mte_get_chunk_tag(_inp);                                       \
+  (_inp->size & PREV_INUSE);                                            \
+})
+#else
 #define inuse(p)\
 ((((mchunkptr)(((char*)(p))+((p)->size & ~PREV_INUSE)))->size) & PREV_INUSE)
+#endif
 
 /* set/clear chunk as being inuse without otherwise disturbing */
 #define set_inuse(p)\
@@ -2045,7 +2053,7 @@ static Void_t *mte_tag_chunk(mchunkptr p) {
   size_t chunk_size = chunksize(p);
   // Generate tag starting at header
   void *tagged_ptr = __arm_mte_create_random_tag((void *)p, 0);
-  printf("Tagging memory from %p for %d bytes with tag %p\n", p, (int)chunk_size, tagged_ptr);
+  // printf("Tagging memory from %p for %d bytes with tag %p\n", p, (int)chunk_size, tagged_ptr);
 
   for (size_t i = 0; i < chunk_size; i += MTE_GRANULE_SIZE) {
     __arm_mte_set_tag((uint8_t *)tagged_ptr + i);
@@ -2053,7 +2061,9 @@ static Void_t *mte_tag_chunk(mchunkptr p) {
 
   // Return user pointer (after header) with the same tag
   // Mirrors what mem2chunk() does
-  return (Void_t*)((char *)tagged_ptr + 2*SIZE_SZ);
+  Void_t* mem = (Void_t*)((char *)tagged_ptr + 2*SIZE_SZ);
+  // printf("[mte_tag_chunk] returning user ptr: %p\n", mem);
+  return mem;
 }
 
 /**
@@ -2070,7 +2080,7 @@ static mchunkptr mte_get_chunk_tag(mchunkptr p) {
  * a void pointer and chunksize takes an mchunkptr
  */
 static void mte_untag_region(void *ptr, size_t size) {
-  printf("Overwriting pointer %p with tag 0 for %d bytes\n", ptr, (int)size);
+  // printf("Overwriting pointer %p with tag 0 for %d bytes\n", ptr, (int)size);
   for (size_t i = 0; i < size; i += MTE_GRANULE_SIZE) {
     __arm_mte_set_tag((uint8_t *)ptr + i);
   }
@@ -2081,6 +2091,7 @@ static void mte_untag_region(void *ptr, size_t size) {
  * mte_tag_chunk, that's right. But this returns the pointer, not an offset
  * to user data and as an mchunkptr for free().
  */
+#ifdef MTE_ENABLED
 static mchunkptr mte_retag_chunk(mchunkptr p) {
   // Iterate over the entire pointer we've given to the user
   size_t chunk_size = chunksize(p);
@@ -2091,6 +2102,25 @@ static mchunkptr mte_retag_chunk(mchunkptr p) {
   }
   return (mchunkptr)tagged_ptr;
 }
+#endif
+
+#ifdef MTE_ENABLED
+static inline mchunkptr mte_retag_chunk_size(void *p, size_t size) {
+    void *tagged = __arm_mte_create_random_tag(p, 0);
+    for (size_t i = 0; i < size; i += MTE_GRANULE_SIZE) {
+        __arm_mte_set_tag((uint8_t *)tagged + i);
+    }
+    return (mchunkptr)tagged;
+}
+#endif
+
+// static void debug_top_tag(const char *where, mchunkptr top) {
+//   if (top == 0) { printf("[top@%s] av->top is NULL\n", where); return; }
+//   void *granule_view = __arm_mte_get_tag((void *)top);
+//   printf("[top@%s] stored ptr=%p  granule tag=%p  match=%s\n",
+//          where, (void*)top, granule_view,
+//          (((uintptr_t)top >> 56) == ((uintptr_t)granule_view >> 56)) ? "yes" : "NO");
+// }
 
 #endif
 
@@ -2207,12 +2237,23 @@ typedef struct malloc_chunk* mbinptr;
 #define last(b)      ((b)->bk)
 
 /* Take a chunk off a bin list */
+#ifdef MTE_ENABLED
+#define unlink(P, BK, FD) {                    \
+    FD = P->fd;                                 \
+    FD = (mchunkptr)mte_get_chunk_tag(FD);      \
+    BK = P->bk;                                 \
+    BK = (mchunkptr)mte_get_chunk_tag(BK);      \
+    FD->bk = BK;                                \
+    BK->fd = FD;                                \
+}
+#else
 #define unlink(P, BK, FD) {                                            \
   FD = P->fd;                                                          \
   BK = P->bk;                                                          \
   FD->bk = BK;                                                         \
   BK->fd = FD;                                                         \
 }
+#endif
 
 /*
   Indexing
@@ -2555,7 +2596,7 @@ static void malloc_init_state(av) mstate av;
   mbinptr bin;
 
   #ifdef MTE_ENABLED
-    printf("@malloc_init_state, MTE enabled so prctl call to back MTE with kernel\n");
+    // printf("@malloc_init_state, MTE enabled so prctl call to back MTE with kernel\n");
     int ret = prctl(PR_SET_TAGGED_ADDR_CTRL,
         PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_SYNC | (0xfffe << PR_MTE_TAG_SHIFT),
         0, 0, 0);
@@ -2563,22 +2604,6 @@ static void malloc_init_state(av) mstate av;
     if (ret != 0) {
       perror("prctl MTE setup failed\n");
     }
-
-    long cur = prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0);
-    
-    if (cur < 0){
-      perror("prctl PR_GET_TAGGED_ADDR_CTRL failed\n");
-    } else {
-      printf("@malloc_init_state, TAGGED_ADDR_CTRL = 0x%1x\n", cur);
-      printf("  TAGGED_ADDR_ENABLE: %s\n", (cur & PR_TAGGED_ADDR_ENABLE) ? "yes" : "NO");
-      printf("  MTE_TCF_SYNC:       %s\n", (cur & PR_MTE_TCF_SYNC) ? "yes" : "NO");
-      printf("  MTE_TCF_ASYNC:      %s\n", (cur & PR_MTE_TCF_ASYNC) ? "yes" : "NO");
-      printf("  tag include mask:   0x%1x\n", (cur >> PR_MTE_TAG_SHIFT) & 0xffff);
-    }
-
-    /* Verify HWCAP2_MTE is actually available — if not, prctl silently no-ops on some kernels */
-    unsigned long hwcap2 = getauxval(AT_HWCAP2);
-    printf("  HWCAP2_MTE present: %s\n", (hwcap2 & HWCAP2_MTE) ? "yes" : "NO");
   #endif
   
   /* Establish circular links for normal bins */
@@ -2603,6 +2628,7 @@ static void malloc_init_state(av) mstate av;
 
   av->top            = initial_top(av);
   av->pagesize       = malloc_getpagesize;
+  // debug_top_tag("init", av->top);
   // printf("@malloc_init_state, max_fast is %d, top is %p, and pagesize %x\n", DEFAULT_MXFAST, av->top, av->pagesize);
 }
 
@@ -2856,7 +2882,7 @@ static void do_check_malloc_state(void)
   CHUNK_SIZE_T  total = 0;
   int max_fast_bin;
 
-  printf("@check_malloc_state, do smth\n");
+  // printf("@check_malloc_state, do smth\n");
 
   /* internal size_t must be no wider than pointer type */
   assert(sizeof(INTERNAL_SIZE_T) <= sizeof(char*));
@@ -2957,6 +2983,21 @@ static void do_check_malloc_state(void)
   assert((CHUNK_SIZE_T)(av->max_total_mem) >=
          (CHUNK_SIZE_T)(av->mmapped_mem) + (CHUNK_SIZE_T)(av->sbrked_mem));
 }
+#endif
+
+#ifdef MTE_ENABLED
+#undef check_chunk
+#undef check_free_chunk
+#undef check_inuse_chunk
+#undef check_remalloced_chunk
+#undef check_malloced_chunk
+#undef check_malloc_state
+#define check_chunk(P)
+#define check_free_chunk(P)
+#define check_inuse_chunk(P)
+#define check_remalloced_chunk(P,N)
+#define check_malloced_chunk(P,N)
+#define check_malloc_state()
 #endif
 
 
@@ -3071,7 +3112,7 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
   */
 
   // printf("@sysmalloc, asked for %d bytes\n", (int)nb);
-  printf("@sysmalloc, top @ %p from %d asking for %d\n", av->top, (int)chunksize(av->top), (int)nb);
+  // printf("@sysmalloc, top @ %p from %d asking for %d\n", av->top, (int)chunksize(av->top), (int)nb);
   if (have_fastchunks(av)) {
     // printf("@sysmalloc, we have free space in fastbins\n");
     assert(in_smallbin_range(nb));
@@ -3145,7 +3186,7 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
 
         check_chunk(p);
         
-        printf("@sysmalloc - chunk2mem, mmap'd large chunk\n");
+        // printf("@sysmalloc - chunk2mem, mmap'd large chunk\n");
         #ifdef MTE_ENABLED
           return mte_tag_chunk(p);
         #else
@@ -3390,6 +3431,7 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
       /* Adjust top based on results of second sbrk */
       if (snd_brk != (char*)(MORECORE_FAILURE)) {
         av->top = (mchunkptr)aligned_brk;
+        // debug_top_tag("first-sbrk", av->top);
         set_head(av->top, (snd_brk - aligned_brk + correction) | PREV_INUSE);
         av->sbrked_mem += correction;
      
@@ -3451,7 +3493,7 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
 
     p = av->top;
     size = chunksize(p);
-    printf("@sysmalloc, chunk is %p and remainder is size %d\n", p, (int)remainder_size);
+    // printf("@sysmalloc, chunk is %p and remainder is size %d\n", p, (int)remainder_size);
     // print_av(av);
     
     /* check that one of the above allocation paths succeeded */
@@ -3463,7 +3505,7 @@ static Void_t* sYSMALLOc(nb, av) INTERNAL_SIZE_T nb; mstate av;
       set_head(remainder, remainder_size | PREV_INUSE);
       check_malloced_chunk(p, nb);
       // print_av(av);
-      printf("@sysmalloc - chunk2mem, heap extension for top\n");
+      // printf("@sysmalloc - chunk2mem, heap extension for top\n");
       #ifdef MTE_ENABLED
         return mte_tag_chunk(p);
       #else
@@ -3591,7 +3633,7 @@ Void_t* mALLOc(size_t bytes)
   */
 
   checked_request2size(bytes, nb);
-  printf("@dlmalloc, asked for %d bytes and normalized to %d bytes\n", (int)bytes, (int)nb);
+  // printf("@dlmalloc, asked for %d bytes and normalized to %d bytes\n", (int)bytes, (int)nb);
 
   /*
     Bypass search if no frees yet
@@ -3613,24 +3655,11 @@ Void_t* mALLOc(size_t bytes)
 
     if ((victim = *fb) != 0) {
       // Victim is still tagged (freed memory was re-tagged)
-      *fb = victim->fd; // Read through 
-
       #ifdef MTE_ENABLED
-      // Untag so check_remalloced_chunk can reader header fields
-      INTERNAL_SIZE_T vsize = chunksize(victim);
-      mte_untag_region((void *)UNTAG_PTR(victim), vsize);
-      victim = (mchunkptr)UNTAG_PTR(victim);
+      victim = (mchunkptr)mte_get_chunk_tag(victim);
       #endif
-
-      check_remalloced_chunk(victim, nb);
-      // printf("@dlmalloc, set fb to victim->fd %p\n", victim->fd);
-      // print_av(av);
-      printf("@sysmalloc - chunk2mem, exact-fit fastbin popped from fastbin LIFO\n");
-      #ifdef MTE_ENABLED
-        return mte_tag_chunk(victim);
-      #else
-        return chunk2mem(victim);
-      #endif
+      *fb = victim->fd;
+      return mte_tag_chunk(victim);  // retag with new allocation tag
     }
   }
 
@@ -3648,19 +3677,17 @@ Void_t* mALLOc(size_t bytes)
     bin = bin_at(av,idx);
 
     if ( (victim = last(bin)) != bin) {
+      #ifdef MTE_ENABLED
+      victim = (mchunkptr)mte_get_chunk_tag(victim);
+      #endif
       bck = victim->bk; // Bk pointer means doubly linked list
+      #ifdef MTE_ENABLED
+      bck = (mchunkptr)mte_get_chunk_tag(bck);
+      #endif
       set_inuse_bit_at_offset(victim, nb);
       bin->bk = bck;
       bck->fd = bin;
-      
-      check_malloced_chunk(victim, nb);
-      // printf("@dlmalloc, using victim??\n");
-      printf("@sysmalloc - chunk2mem, smallbin exact fit, unlinked from link list\n");
-      #ifdef MTE_ENABLED
-        return mte_tag_chunk(victim);
-      #else
-        return chunk2mem(victim);
-      #endif
+      return mte_tag_chunk(victim);
     }
   }
 
@@ -3691,7 +3718,13 @@ Void_t* mALLOc(size_t bytes)
   */
     
   while ( (victim = unsorted_chunks(av)->bk) != unsorted_chunks(av)) {
+    #ifdef MTE_ENABLED
+    victim = (mchunkptr)mte_get_chunk_tag(victim);
+    #endif
     bck = victim->bk;
+    #ifdef MTE_ENABLED
+    bck = (mchunkptr)mte_get_chunk_tag(bck);
+    #endif
     size = chunksize(victim);
     
     /* 
@@ -3719,7 +3752,7 @@ Void_t* mALLOc(size_t bytes)
       set_foot(remainder, remainder_size);
       
       check_malloced_chunk(victim, nb);
-      printf("@sysmalloc - chunk2mem, last remainder split. Keep leftover as dv\n");
+      // printf("@sysmalloc - chunk2mem, last remainder split. Keep leftover as dv\n");
       #ifdef MTE_ENABLED
         return mte_tag_chunk(victim);
       #else
@@ -3736,7 +3769,7 @@ Void_t* mALLOc(size_t bytes)
     if (size == nb) {
       set_inuse_bit_at_offset(victim, size);
       check_malloced_chunk(victim, nb);
-      printf("@sysmalloc - chunk2mem, unsorted bin exact fit\n");
+      // printf("@sysmalloc - chunk2mem, unsorted bin exact fit\n");
       #ifdef MTE_ENABLED
         return mte_tag_chunk(victim);
       #else
@@ -3749,7 +3782,11 @@ Void_t* mALLOc(size_t bytes)
     if (in_smallbin_range(size)) {
       victim_index = smallbin_index(size);
       bck = bin_at(av, victim_index);
-      fwd = bck->fd;
+      fwd = bck->fd; // bck already tagged but fwd points to another tagged chunk
+      #ifdef MTE_ENABLED
+      if (fwd != bck) // only if bin is non-empty
+        fwd = (mchunkptr)mte_get_chunk_tag(fwd);
+      #endif
     }
     else {
       victim_index = largebin_index(size);
@@ -3767,14 +3804,26 @@ Void_t* mALLOc(size_t bytes)
           
           /* maintain large bins in sorted order */
           size |= PREV_INUSE; /* Or with inuse bit to speed comparisons */
-          while ((CHUNK_SIZE_T)(size) < (CHUNK_SIZE_T)(fwd->size)) 
+          while ((CHUNK_SIZE_T)(size) < (CHUNK_SIZE_T)(fwd->size)) {
             fwd = fwd->fd;
+            #ifdef MTE_ENABLED
+            fwd = (mchunkptr)mte_get_chunk_tag(fwd);
+            #endif
+          }
           bck = fwd->bk;
+          #ifdef MTE_ENABLED
+          bck = (mchunkptr)mte_get_chunk_tag(bck);
+          #endif
         }
       }
     }
       
     mark_bin(av, victim_index);
+    #ifdef MTE_ENABLED
+    // When placing into smallbin/largebin:
+    fwd = bck->fd;
+    fwd = (mchunkptr)mte_get_chunk_tag(fwd);
+    #endif
     victim->bk = bck;
     victim->fd = fwd;
     fwd->bk = victim;
@@ -3794,6 +3843,9 @@ Void_t* mALLOc(size_t bytes)
     bin = bin_at(av, idx);
     
     for (victim = last(bin); victim != bin; victim = victim->bk) {
+      #ifdef MTE_ENABLED
+      victim = (mchunkptr)mte_get_chunk_tag(victim);
+      #endif
       size = chunksize(victim);
       
       if ((CHUNK_SIZE_T)(size) >= (CHUNK_SIZE_T)(nb)) {
@@ -3804,7 +3856,7 @@ Void_t* mALLOc(size_t bytes)
         if (remainder_size < MINSIZE)  {
           set_inuse_bit_at_offset(victim, size);
           check_malloced_chunk(victim, nb);
-          printf("@sysmalloc - chunk2mem, large bin exhaust (take all). Dont do leftover\n");
+          // printf("@sysmalloc - chunk2mem, large bin exhaust (take all). Dont do leftover\n");
           #ifdef MTE_ENABLED
             return mte_tag_chunk(victim);
           #else
@@ -3820,7 +3872,7 @@ Void_t* mALLOc(size_t bytes)
           set_head(remainder, remainder_size | PREV_INUSE);
           set_foot(remainder, remainder_size);
           check_malloced_chunk(victim, nb);
-          printf("@sysmalloc - chunk2mem, large bin but split and remainder in unsorted\n");
+          // printf("@sysmalloc - chunk2mem, large bin but split and remainder in unsorted\n");
           #ifdef MTE_ENABLED
             return mte_tag_chunk(victim);
           #else
@@ -3893,7 +3945,7 @@ Void_t* mALLOc(size_t bytes)
       if (remainder_size < MINSIZE) {
         set_inuse_bit_at_offset(victim, size);
         check_malloced_chunk(victim, nb);
-        printf("@sysmalloc - chunk2mem, binmap scan exhuast. No leftover.\n");
+        // printf("@sysmalloc - chunk2mem, binmap scan exhuast. No leftover.\n");
         #ifdef MTE_ENABLED
           return mte_tag_chunk(victim);
         #else
@@ -3915,7 +3967,7 @@ Void_t* mALLOc(size_t bytes)
         set_head(remainder, remainder_size | PREV_INUSE);
         set_foot(remainder, remainder_size);
         check_malloced_chunk(victim, nb);
-        printf("@sysmalloc - chunk2mem, binmap scan exhuast. Leftover to unsorted.\n");
+        // printf("@sysmalloc - chunk2mem, binmap scan exhuast. Leftover to unsorted.\n");
         #ifdef MTE_ENABLED
           return mte_tag_chunk(victim);
         #else
@@ -3947,12 +3999,14 @@ Void_t* mALLOc(size_t bytes)
   if ((CHUNK_SIZE_T)(size) >= (CHUNK_SIZE_T)(nb + MINSIZE)) {
     remainder_size = size - nb;
     remainder = chunk_at_offset(victim, nb);
+    // debug_top_tag("malloc-shrink-before", av->top);
     av->top = remainder;
+    // debug_top_tag("malloc-shrink-after", av->top);
     set_head(victim, nb | PREV_INUSE);
     set_head(remainder, remainder_size | PREV_INUSE);
     
     check_malloced_chunk(victim, nb);
-    printf("@sysmalloc - chunk2mem, top chunk split.\n");
+    // printf("@sysmalloc - chunk2mem, top chunk split.\n");
     #ifdef MTE_ENABLED
       return mte_tag_chunk(victim);
     #else
@@ -3992,7 +4046,7 @@ void fREe(mem) Void_t* mem;
   /* free(0) has no effect */
   if (mem != 0) {
     p = mem2chunk(mem);
-    printf("@free, mem2chunk returned %p\n", p);
+    // printf("@free, mem2chunk returned %p\n", p);
     size = chunksize(p);
 
     #ifdef MTE_ENABLED
@@ -4026,15 +4080,11 @@ void fREe(mem) Void_t* mem;
 
       set_fastchunks(av);
       fb = &(av->fastbins[fastbin_index(size)]);
-      printf("@free, setting fastbins to %p\n", fb);
-
+      // printf("@free, setting fastbins to %p\n", fb);
+      p->fd = *fb; // fb carries some other chunk's free tag
       #ifdef MTE_ENABLED
-      // Retag pointer before linking for next use
-      // THIS HAPPENS BEFORE *fb = p IN FASTBIN PATH
       p = (mchunkptr)mte_retag_chunk(p);
       #endif
-
-      p->fd = *fb; // fb carries some other chunk's free tag
       *fb = p; // store tag in fastbin header to use on next pop
     }
 
@@ -4057,11 +4107,9 @@ void fREe(mem) Void_t* mem;
         prevsize = p->prev_size; // read at tag 0
         size += prevsize;
         p = chunk_at_offset(p, -((long) prevsize));
-
         #ifdef MTE_ENABLED
-        p = mte_get_chunk_tag(p); // Retrieve its tag
+        p = (mchunkptr)mte_get_chunk_tag(p);
         #endif
-
         unlink(p, bck, fwd);  // unlink reads fd/bk through p
       }
 
@@ -4089,9 +4137,11 @@ void fREe(mem) Void_t* mem;
         fwd = bck->fd;
 
         #ifdef MTE_ENABLED
-        // Retag pointer before linking for next use
-        // THIS HAPPENS BEFORE bck->fd = p in UNSORTED BIN INSERT
-        p = (mchunkptr)mte_retag_chunk(p);
+        if (fwd != bck)
+          fwd = (mchunkptr)mte_get_chunk_tag(fwd);
+        // Untag merged region, retag with fresh tag
+        mte_untag_region((void *)UNTAG_PTR(p), size);
+        p = (mchunkptr)mte_retag_chunk_size(UNTAG_PTR(p), size);
         #endif
 
         p->bk = bck;  // writes thru tagged p
@@ -4112,8 +4162,14 @@ void fREe(mem) Void_t* mem;
 
       else {
         size += nextsize;
+        #ifdef MTE_ENABLED
+        mte_untag_region((void *)UNTAG_PTR(p), size);
+        p = (mchunkptr)UNTAG_PTR(p);
+        #endif
         set_head(p, size | PREV_INUSE);
+        // debug_top_tag("free-grow-before", av->top);
         av->top = p;  // stores p at tag 0 but ok bc never tag top
+        // debug_top_tag("free-grow-after", av->top);
         check_chunk(p);
       }
 
@@ -4202,7 +4258,7 @@ static void malloc_consolidate(av) mstate av;
     yet been initialized, in which case do so below
   */
 
-  printf("@malloc_consolidate, max_fast is %d\n", (int)av->max_fast);
+  // printf("@malloc_consolidate, max_fast is %d\n", (int)av->max_fast);
   if (av->max_fast != 0) {
     clear_fastchunks(av);
 
@@ -4218,41 +4274,79 @@ static void malloc_consolidate(av) mstate av;
     
     maxfb = &(av->fastbins[fastbin_index(av->max_fast)]);
     fb = &(av->fastbins[0]);
-    printf("@malloc_consolidate, from fastbin 0:%d => %p to %p\n", (int)fastbin_index(av->max_fast), fb, maxfb);
+    // printf("@malloc_consolidate, from fastbin 0:%d => %p to %p\n", (int)fastbin_index(av->max_fast), fb, maxfb);
     do {
+      // printf("[consolidate outer] fb=%p\n", (void*)fb);
+      // printf("[consolidate outer] *fb=%p\n", (void*)*fb);
       if ( (p = *fb) != 0) {
+        // printf("[consolidate outer] p=%p, clearing fb\n", (void*)p);
         *fb = 0;
         
         do {
+          // printf("[consolidate inner] p before untag=%p\n", (void*)p);
+          #ifdef MTE_ENABLED
+          // Fastbin fd chain may carry stale tags from earlier operations
+          p = (mchunkptr)mte_get_chunk_tag(p);  // NOT UNTAG_PTR
+          #endif
+          // printf("[consolidate inner] p after untag=%p\n", (void*)p);
           check_inuse_chunk(p);
-          nextp = p->fd;
+          // printf("[consolidate inner] check done\n");
+          // printf("[consolidate inner] reading p->fd at %p\n", (void*)&(p->fd));
+          nextp = p->fd; // reads fd — correct tag now
+          // printf("[consolidate inner] nextp=%p\n", (void*)nextp);
           
           /* Slightly streamlined version of consolidation code in free() */
           size = p->size & ~PREV_INUSE;
+          // printf("[consolidate inner] do bit stuff p=%p size=%zu\n", (void*)p, size);
+
           nextchunk = chunk_at_offset(p, size);
+          // printf("[consolidate] nextchunk raw=%p\n", (void*)nextchunk);
+
           #ifdef MTE_ENABLED
           // If using MTE, need to access chunk, get tag first
           nextchunk = mte_get_chunk_tag(nextchunk);
+          // printf("[consolidate] nextchunk tagged=%p\n", (void*)nextchunk);
           #endif
+
+          // printf("[consolidate] reading nextsize...\n");
           nextsize = chunksize(nextchunk);
+          // printf("[consolidate] nextsize=%zu\n", nextsize);
           
+          // printf("[consolidate] checking prev_inuse...\n");
           if (!prev_inuse(p)) {
             prevsize = p->prev_size;
+            // printf("[consolidate] backward coalesce prevsize=%zu\n", prevsize);
             size += prevsize;
+            // printf("[consolidate] backward coalesce size=%zu\n", size);
             p = chunk_at_offset(p, -((long) prevsize));
+            // printf("[consolidate] prev chunk at %p\n", (void*)p);
+            #ifdef MTE_ENABLED
+            p = (mchunkptr)mte_get_chunk_tag(p);  // prev is free, get its tag
+            #endif
             unlink(p, bck, fwd);
+            // printf("[consolidate] unlink done\n");
           }
           
+          // printf("[consolidate] checking if nextchunk is top...\n");
           if (nextchunk != av->top) {
+            // printf("[consolidate] not top, checking inuse_bit_at_offset...\n");
             nextinuse = inuse_bit_at_offset(nextchunk, nextsize);
+            // printf("[consolidate] nextinuse=%d\n", nextinuse);
             set_head(nextchunk, nextsize);
-            
+            // printf("[consolidate] set_head done\n");
+
             if (!nextinuse) {
               size += nextsize;
               unlink(nextchunk, bck, fwd);
             }
             
             first_unsorted = unsorted_bin->fd;
+            #ifdef MTE_ENABLED
+            if (first_unsorted != unsorted_bin)
+              first_unsorted = (mchunkptr)mte_get_chunk_tag(first_unsorted);
+            mte_untag_region((void *)UNTAG_PTR(p), size);
+            p = (mchunkptr)mte_retag_chunk_size(UNTAG_PTR(p), size);
+            #endif
             unsorted_bin->fd = p;
             first_unsorted->bk = p;
             
@@ -4264,8 +4358,13 @@ static void malloc_consolidate(av) mstate av;
           
           else {
             size += nextsize;
+            #ifdef MTE_ENABLED
+            mte_untag_region((void *)UNTAG_PTR(p), size);
+            p = (mchunkptr)UNTAG_PTR(p);
+            #endif
             set_head(p, size | PREV_INUSE);
             av->top = p;
+            // debug_top_tag("consolidate", av->top);
           }
           
         } while ( (p = nextp) != 0);
@@ -4323,34 +4422,68 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
 #endif
 
   /* realloc of null is supposed to be same as malloc */
+
+  // oldmem carries tag
+  // debug_top_tag("realloc-before-malloc", av->top);
   if (oldmem == 0) return mALLOc(bytes);
+  // debug_top_tag("realloc-after-malloc", av->top);
 
   checked_request2size(bytes, nb);
 
+  // preserves tag so oldp has it too
   oldp    = mem2chunk(oldmem);
   oldsize = chunksize(oldp);
+
+  #ifdef MTE_ENABLED
+  // Strip and untag oldp. Now rest of code works with raw pointers
+  mte_untag_region((void *)UNTAG_PTR(oldp), oldsize);
+  oldp = (mchunkptr)UNTAG_PTR(oldp);
+  oldmem = UNTAG_PTR(oldmem);
+  #endif
 
   check_inuse_chunk(oldp);
 
   if (!chunk_is_mmapped(oldp)) {
+    // printf("...We're asking for %d and we have %d\n", (int)nb, (int)oldsize);
 
     if ((CHUNK_SIZE_T)(oldsize) >= (CHUNK_SIZE_T)(nb)) {
       /* already big enough; split below */
-      newp = oldp;
+      newp = oldp; // Has user's tag
+      // printf("@realloc, setting newsize to oldsize 0x%x\n", oldsize);
       newsize = oldsize;
     }
 
     else {
+      // propogates oldp's tag onto a pointer that points into a diff chunk
+      // so need to access next chunk by identifying its tag first
       next = chunk_at_offset(oldp, oldsize);
+      #ifdef MTE_ENABLED
+      // next inherits oldp's tag from the offset arithmetic but points into
+      // a diff chunk whose granules carry their own tag. Read the actual 
+      // granule tag so subsequent accesses (chunksize, inuse, fd/bk) match
+      next = mte_get_chunk_tag(next);
+      #endif
 
       /* Try to expand forward into top */
       if (next == av->top &&
           (CHUNK_SIZE_T)(newsize = oldsize + chunksize(next)) >=
           (CHUNK_SIZE_T)(nb + MINSIZE)) {
+        // oldp is untagged so set_head_size writes oldp->size and chunk_at_offset
+        // computes new top address (tag 0 all around)
+        // printf("@realloc, in expand forward into top path\n");
         set_head_size(oldp, nb);
+        // debug_top_tag("realloc-expand-top", av->top);
         av->top = chunk_at_offset(oldp, nb);
+        // debug_top_tag("realloc-expand-top-before-set-head", av->top);
         set_head(av->top, (newsize - nb) | PREV_INUSE);
+        // debug_top_tag("realloc-expand-top-after-set-head", av->top);
+        // PROBLEM: this guy still has the old tag
+        // Retag on return (tag is 0) with fresh tag
+        #ifdef MTE_ENABLED
+        return mte_tag_chunk(oldp);
+        #else
         return chunk2mem(oldp);
+        #endif
       }
       
       /* Try to expand forward into next chunk;  split off remainder below */
@@ -4358,23 +4491,40 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
                !inuse(next) &&
                (CHUNK_SIZE_T)(newsize = oldsize + chunksize(next)) >=
                (CHUNK_SIZE_T)(nb)) {
+        // printf("@realloc, in expand forward into next chunk path\n");
+        // debug_top_tag("realloc-expand-next-chunk", av->top);
+        // No change needed because memory has tag 0 so can read 
+        // next->fd and next->bk
         newp = oldp;
         unlink(next, bck, fwd);
       }
 
       /* allocate, copy, free */
       else {
-        newmem = mALLOc(nb - MALLOC_ALIGN_MASK);
+        // printf("@realloc, in allocation, copy, free path\n");
+        newmem = mALLOc(nb - MALLOC_ALIGN_MASK); // has tag
         if (newmem == 0)
           return 0; /* propagate failure */
       
-        newp = mem2chunk(newmem);
+        // debug_top_tag("realloc-allocate-copy-free", av->top);
+        // printf("@realloc, newmem from malloc is %p\n", newmem);
+        newp = mem2chunk(newmem); 
+        // printf("@realloc, newp (mem2chunk) is %p\n", (void*)newp);
         newsize = chunksize(newp);
+        // printf("@realloc, newsize is %d\n", (int)newsize);
         
         /*
           Avoid copy if newp is next chunk after oldp.
         */
+        #ifdef MTE_ENABLED
+        // Comparison might fail if have diff tags but point to same address
+        // so strip both for comparison
+        if ((mchunkptr)UNTAG_PTR(newp) == (mchunkptr)UNTAG_PTR(next)) {
+        #else
         if (newp == next) {
+          // printf("@realloc, newp == next, merging\n");
+        #endif
+          // newp is now oldp (untagged, tag 0)
           newsize += oldsize;
           newp = oldp;
         }
@@ -4385,7 +4535,14 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
             INTERNAL_SIZE_T-sized words; minimally 3.
           */
           
-          copysize = oldsize - SIZE_SZ;
+          #ifdef MTE_ENABLED
+          copysize = oldsize - 2*SIZE_SZ; // only copy actual user data within tagged region
+          #else
+          copysize = oldsize - SIZE_SZ; // includes next chunk's prev size
+          #endif
+
+          // oldmem was untagged but newmem is tagged so copy reads from
+          // tag 0 memory and writes to tagged memory
           s = (INTERNAL_SIZE_T*)(oldmem);
           d = (INTERNAL_SIZE_T*)(newmem);
           ncopies = copysize / sizeof(INTERNAL_SIZE_T);
@@ -4395,6 +4552,22 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
             MALLOC_COPY(d, s, copysize);
           
           else {
+            // printf("@realloc, starting copy: s=%p d=%p ncopies=%d\n", (void*)s, (void*)d, ncopies);
+            // for (int _ci = 0; _ci < ncopies; _ci++) {
+            //   void *src_addr = (void*)(s + _ci);
+            //   void *dst_addr = (void*)(d + _ci);
+            //   #ifdef MTE_ENABLED
+            //   void *src_mtag = __arm_mte_get_tag(src_addr);
+            //   void *dst_mtag = __arm_mte_get_tag(dst_addr);
+            //   printf("  word %d: src=%p mem_tag=%p | dst=%p mem_tag=%p\n",
+            //     _ci, src_addr, src_mtag, dst_addr, dst_mtag);
+            //   printf("  word %d: src_raw=0x%lx dst_raw=0x%lx\n",
+            //     _ci, (unsigned long)(uintptr_t)src_addr, (unsigned long)(uintptr_t)dst_addr);
+            //   #endif
+            //   *(d + _ci) = *(s + _ci);
+            //   printf("  word %d OK\n", _ci);
+            // }
+
             *(d+0) = *(s+0);
             *(d+1) = *(s+1);
             *(d+2) = *(s+2);
@@ -4410,11 +4583,21 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
                 }
               }
             }
+            // printf("@realloc, copy done\n");
           }
           
+          // debug_top_tag("realloc-before-free", av->top);
+          // free usually expects a tagged pointer but oldmem has tag 0
+          // ...we should be fine
           fREe(oldmem);
+          // printf("@realloc, freed oldmem\n");
           check_inuse_chunk(newp);
+  
+          #ifdef MTE_ENABLED
+          return newmem; // already tagged by malloc so just return it
+          #else
           return chunk2mem(newp);
+          #endif
         }
       }
     }
@@ -4424,22 +4607,30 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
     assert((CHUNK_SIZE_T)(newsize) >= (CHUNK_SIZE_T)(nb));
 
     remainder_size = newsize - nb;
+    // printf("@realloc, remainder size is 0x%x\n", remainder_size);
 
     if (remainder_size < MINSIZE) { /* not enough extra to split off */
       set_head_size(newp, newsize);
-      set_inuse_bit_at_offset(newp, newsize);
+      set_inuse_bit_at_offset(newp, newsize); // macro handles MTE
+      // printf("@realloc...not enough extra to split off\n");
     }
     else { /* split remainder */
       remainder = chunk_at_offset(newp, nb);
       set_head_size(newp, nb);
       set_head(remainder, remainder_size | PREV_INUSE);
       /* Mark remainder as inuse so free() won't complain */
-      set_inuse_bit_at_offset(remainder, remainder_size);
+      set_inuse_bit_at_offset(remainder, remainder_size); // macro handles MTE
+      // printf("@realloc...mark remainder as freed\n");
       fREe(chunk2mem(remainder)); 
     }
 
+    // newp is untagged bc it's oldp so need to tag it
     check_inuse_chunk(newp);
+    #ifdef MTE_ENABLED
+    return mte_tag_chunk(newp);
+    #else
     return chunk2mem(newp);
+    #endif
   }
 
   /*
@@ -4447,6 +4638,7 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
   */
 
   else {
+    // printf("@realloc, chunk is mmapped\n");
 #if HAVE_MMAP
 
 #if HAVE_MREMAP
@@ -4459,9 +4651,15 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
     newsize = (nb + offset + SIZE_SZ + pagemask) & ~pagemask;
 
     /* don't need to remap if still within same page */
-    if (oldsize == newsize - offset) 
+    if (oldsize == newsize - offset)  {
+      #ifdef MTE_ENABLED
+      return mte_tag_chunk(mem2chunk(oldmem));
+      #else
       return oldmem;
+      #endif
+    }
 
+    // debug_top_tag("realloc-before-mremap", av->top);
     cp = (char*)mremap((char*)oldp - offset, oldsize + offset, newsize, 1);
     
     if (cp != (char*)MORECORE_FAILURE) {
@@ -4480,22 +4678,32 @@ Void_t* rEALLOc(oldmem, bytes) Void_t* oldmem; size_t bytes;
       if (sum > (CHUNK_SIZE_T)(av->max_total_mem)) 
         av->max_total_mem = sum;
       
+      #ifdef MTE_ENABLED
+      return mte_tag_chunk(newp);
+      #else
       return chunk2mem(newp);
+      #endif
     }
 #endif
 
     /* Note the extra SIZE_SZ overhead. */
-    if ((CHUNK_SIZE_T)(oldsize) >= (CHUNK_SIZE_T)(nb + SIZE_SZ)) 
-      newmem = oldmem; /* do nothing */
-    else {
+    if ((CHUNK_SIZE_T)(oldsize) >= (CHUNK_SIZE_T)(nb + SIZE_SZ)) {
+      // Already big enough retag since we untagged at entry
+      #ifdef MTE_ENABLED
+      return mte_tag_chunk(mem2chunk(oldmem));
+      #else
+      return oldmem;
+      #endif
+    } else {
       /* Must alloc, copy, free. */
-      newmem = mALLOc(nb - MALLOC_ALIGN_MASK);
+      newmem = mALLOc(nb - MALLOC_ALIGN_MASK); // already tagged by malloc
       if (newmem != 0) {
         MALLOC_COPY(newmem, oldmem, oldsize - 2*SIZE_SZ);
         fREe(oldmem);
       }
+      // newmem is already tagged by malloc
+      return newmem;
     }
-    return newmem;
 
 #else 
     /* If !HAVE_MMAP, but chunk_is_mmapped, user must have overwritten mem */
@@ -4626,44 +4834,35 @@ Void_t* cALLOc(n_elements, elem_size) size_t n_elements; size_t elem_size;
   CHUNK_SIZE_T  nclears;
   INTERNAL_SIZE_T* d;
 
+  // Returns a tagged user pointer with some random tag
   Void_t* mem = mALLOc(n_elements * elem_size);
+  // printf("@calloc, finished calling malloc\n");
 
   if (mem != 0) {
+    // Inherits tagged pointer
+    // This succeeds because we tag the entire pointer incl metdata
+    // If only tagged user payload, this would fault
     p = mem2chunk(mem);
 
     if (!chunk_is_mmapped(p))
     {  
       /*
-        Unroll clear of <= 36 bytes (72 if 8byte sizes)
-        We know that contents have an odd number of
-        INTERNAL_SIZE_T-sized words; minimally 3.
-      */
+        Clear user payload, stopping at chunk boundary.
+        Under MTE, chunksize - SIZE_SZ would extend into the nezt chunk's
+        first granule, which carried a diff tag and would fault. We give
+        up dlmalloc's boundary-overlap trick (last SIZE_SZ word) in exchange
+        for staying within our tagged region
+      */  
 
-      d = (INTERNAL_SIZE_T*)mem;
-      clearsize = chunksize(p) - SIZE_SZ;
-      nclears = clearsize / sizeof(INTERNAL_SIZE_T);
-      assert(nclears >= 3);
-
-      if (nclears > 9)
-        MALLOC_ZERO(d, clearsize);
-
-      else {
-        *(d+0) = 0;
-        *(d+1) = 0;
-        *(d+2) = 0;
-        if (nclears > 4) {
-          *(d+3) = 0;
-          *(d+4) = 0;
-          if (nclears > 6) {
-            *(d+5) = 0;
-            *(d+6) = 0;
-            if (nclears > 8) {
-              *(d+7) = 0;
-              *(d+8) = 0;
-            }
-          }
-        }
-      }
+      d = (INTERNAL_SIZE_T*)mem;  // Already carries tagged pointer
+      // Now clear from mem (=chunk+16) up to chunk + chunksize
+      // printf("@calloc, do clearsize calculation now\n");
+      clearsize = chunksize(p) - 2*SIZE_SZ;
+  
+      // No hot path optimization that avoids this function call
+      // printf("@calloc, do MALLOC_ZERO now\n");
+      MALLOC_ZERO(d, clearsize);
+      // printf("@calloc, finished MALLOC_ZERO \n");
     }
 #if ! MMAP_CLEARS
     else
@@ -4677,6 +4876,7 @@ Void_t* cALLOc(n_elements, elem_size) size_t n_elements; size_t elem_size;
     }
 #endif
   }
+  // printf("@calloc, now return mem\n");
   return mem;
 }
 
